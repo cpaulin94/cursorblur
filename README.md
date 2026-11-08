@@ -40,15 +40,24 @@ No Accessibility permission needed — it only reads `NSEvent.mouseLocation`.
 
 ## Settings
 
-| Setting | What it does |
-|---|---|
-| Strength | Overall opacity of the blur |
-| Trail length (frames) | How far back the trail reaches, in display frames |
-| Samples | Number of cursor copies drawn along the trail |
-| Head bias | Weights opacity toward the newest position |
-| Movement threshold (pt) | Below this movement no blur is drawn |
-| Hide real cursor | Shows only the blurred trail |
-| Launch at login | Starts cursorblur automatically (app bundle only) |
+The menu shows a live preview of the current settings, a small diagram next to each
+slider, and how much latency each one adds.
+
+| Setting | What it does | Added pointer latency |
+|---|---|---|
+| Strength | Opacity of the trail | 0 ms |
+| Trail length | How many past frames are smeared (1 frame = 8.3 ms at 120 Hz) | 0 ms. The trail covers past motion; the pointer itself is not delayed |
+| Samples | Copies drawn per frame: smoother trail, more GPU work | 0 ms |
+| Head bias | Fades the trail toward its tail | 0 ms |
+| Movement threshold | Movements below this draw no trail | 0 ms |
+| Hide real cursor | Shows only the cursor drawn by cursorblur | **1–2 frames** (≈ 8–17 ms at 120 Hz, 17–33 ms at 60 Hz) |
+| Launch at login | Starts cursorblur automatically (app bundle only) | — |
+
+Why only one setting adds latency: macOS draws the real cursor on a dedicated hardware
+layer, updated at scan-out. Everything cursorblur draws goes through a normal window,
+which the compositor shows on the next frame or the one after. With the real cursor
+visible, that delay only affects the trail behind it. With the real cursor hidden, the
+cursor you see is cursorblur's, so the delay applies to the pointer itself.
 
 Settings persist in `UserDefaults`.
 
