@@ -70,6 +70,35 @@ func showSystemCursor() {
     CGDisplayShowCursor(CGMainDisplayID())
 }
 
+// Deprecated in the SDK but still exported and accurate; used to notice when
+// macOS resets the hide count (app switches, Dock, Mission Control, menus…).
+@_silgen_name("CGCursorIsVisible")
+func systemCursorIsVisible() -> Int32
+
+// MARK: - Cached cursor image
+
+/// The current system cursor, rasterized once. Fetching `NSCursor.currentSystem`
+/// is a window-server round trip that returns a fresh NSImage, so we refresh it
+/// only every few frames instead of on every display tick.
+struct CursorSnapshot {
+    var image: CGImage?
+    var size: CGSize = .zero
+    var hotSpot: CGPoint = .zero
+
+    static func current() -> CursorSnapshot {
+        let c = NSCursor.currentSystem ?? NSCursor.arrow
+        let size = c.image.size
+        var rect = NSRect(origin: .zero, size: size)
+        let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
+        let ctx = NSGraphicsContext(cgContext: CGContext(
+            data: nil, width: Int(size.width * scale), height: Int(size.height * scale),
+            bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!, flipped: false)
+        let img = c.image.cgImage(forProposedRect: &rect, context: ctx, hints: nil)
+        return CursorSnapshot(image: img, size: size, hotSpot: c.hotSpot)
+    }
+}
+
 // MARK: - Vista che disegna la scia
 
 final class BlurView: NSView {
@@ -77,7 +106,8 @@ final class BlurView: NSView {
     private var pts: [CGPoint] = []
     private var moving = false
     private var hide = false
-    private var image: NSImage?
+    private var image: CGImage?
+    private var imageSize: CGSize = .zero
     private var hotSpot: CGPoint = .zero
     private var lastDirty: NSRect = .zero
 
@@ -85,17 +115,18 @@ final class BlurView: NSView {
     override var isOpaque: Bool { false }
 
     /// `global`: posizioni dalla più vecchia alla più recente, in coordinate globali.
-    func update(points global: [CGPoint], moving: Bool, hide: Bool, cursor: NSCursor) {
+    func update(points global: [CGPoint], moving: Bool, hide: Bool, cursor: CursorSnapshot) {
         pts = global.map { CGPoint(x: $0.x - screenOrigin.x, y: $0.y - screenOrigin.y) }
         self.moving = moving
         self.hide = hide
         image = cursor.image
+        imageSize = cursor.size
         hotSpot = cursor.hotSpot
 
         var dirty = NSRect.zero
-        if moving || hide, let img = image, let head = pts.last {
-            let rects = moving ? pts.map { cursorRect(at: $0, size: img.size) }
-                               : [cursorRect(at: head, size: img.size)]
+        if moving || hide, image != nil, let head = pts.last {
+            let rects = moving ? pts.map { cursorRect(at: $0, size: imageSize) }
+                               : [cursorRect(at: head, size: imageSize)]
             dirty = rects.dropFirst().reduce(rects[0]) { $0.union($1) }
                 .insetBy(dx: -2, dy: -2).intersection(bounds)
         }
@@ -111,14 +142,14 @@ final class BlurView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.clear.set()
-        dirtyRect.fill(using: .copy)
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.clear(dirtyRect)
         guard let img = image, let head = pts.last else { return }
-        let size = img.size
+        let size = imageSize
 
         func stamp(_ p: CGPoint, _ alpha: CGFloat) {
-            img.draw(in: cursorRect(at: p, size: size), from: .zero,
-                     operation: .sourceOver, fraction: alpha)
+            ctx.setAlpha(alpha)
+            ctx.draw(img, in: cursorRect(at: p, size: size))
         }
 
         if !moving {
@@ -217,8 +248,19 @@ final class Controller: NSObject, NSMenuDelegate {
     private var hideItem: NSMenuItem!
     private var hideCount = 0   // CGDisplayHideCursor è a conteggio: teniamo traccia delle chiamate
     private var signalSources: [DispatchSourceSignal] = []
+    private var cursor = CursorSnapshot.current()
+    private var tickCount = 0
+    private var activity: NSObjectProtocol?
+    private let debug = ProcessInfo.processInfo.environment["CURSORBLUR_DEBUG"] != nil
+    private var debugFrames = 0
+    private var debugStart = CACurrentMediaTime()
 
     func start() {
+        // Keep the display link at full rate: without this, App Nap throttles the
+        // (background, menu-bar-only) app and the trail stutters or lingers.
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+            reason: "Real-time cursor rendering")
         buildWindows()
         setupMenu()
         setupSignals()
@@ -279,7 +321,17 @@ final class Controller: NSObject, NSMenuDelegate {
         }
         let moving = s.enabled && length >= CGFloat(s.minDistance)
         let hide = s.enabled && s.hideCursor
-        let cursor = NSCursor.currentSystem ?? NSCursor.arrow
+        tickCount &+= 1
+        if debug {
+            debugFrames += 1
+            let now = CACurrentMediaTime()
+            if now - debugStart >= 1 {
+                NSLog("cursorblur: %d fps", debugFrames)
+                debugFrames = 0; debugStart = now
+            }
+        }
+        if tickCount % 3 == 0 { cursor = CursorSnapshot.current() }
+        if hide && tickCount % 15 == 0 { reassertIfShown() }
         for v in views { v.update(points: history, moving: moving, hide: hide, cursor: cursor) }
     }
 
@@ -300,6 +352,14 @@ final class Controller: NSObject, NSMenuDelegate {
     private func reassertHidden() {
         let s = Settings.shared
         guard s.enabled && s.hideCursor else { return }
+        reassertIfShown()
+    }
+
+    /// If the system reset the hide count and the real cursor is visible again,
+    /// start counting from zero and hide it once more.
+    private func reassertIfShown() {
+        guard systemCursorIsVisible() != 0 else { return }
+        hideCount = 0
         hideNow()
     }
 
