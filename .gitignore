@@ -1,3 +1,6 @@
 cursorblur
 *.o
 .DS_Store
+*.app
+build/
+.claude/settings.local.json
