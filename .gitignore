@@ -1,6 +1,12 @@
+# build
 cursorblur
-*.o
-.DS_Store
-*.app
 build/
-.claude/settings.local.json
+*.o
+*.app
+
+# macOS
+.DS_Store
+
+# local tooling
+CLAUDE.md
+.claude/

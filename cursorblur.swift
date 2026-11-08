@@ -1,13 +1,14 @@
-// cursorblur.swift — motion blur per il cursore di macOS
+// cursorblur.swift — real-time motion blur for the macOS cursor
 //
-// Compila:  swiftc -O cursorblur.swift -o cursorblur
-// Avvia:    ./cursorblur            (oppure ./cursorblur --hide per partire col cursore reale nascosto)
-// Impostazioni ed uscita: icona ◐ nella barra dei menu (o Ctrl+C nel Terminale)
+// Build:    ./build.sh            (CLI binary)   |   ./build.sh app   (cursorblur.app)
+// Run:      ./build.sh run        (add --hide to start with the real cursor hidden)
+// Settings and Quit: the ◐ icon in the menu bar (or Ctrl+C in Terminal)
 //
-// Richiede macOS 14+ (display link nativo, segue il refresh ProMotion a 120 Hz).
+// Requires macOS 14+ (native display link, follows ProMotion refresh up to 120 Hz).
 
 import AppKit
 import QuartzCore
+import ServiceManagement
 
 // MARK: - Impostazioni persistenti
 
@@ -210,6 +211,7 @@ final class Controller: NSObject, NSMenuDelegate {
     private var link: CADisplayLink?
     private var history: [CGPoint] = [NSEvent.mouseLocation]
     private var statusItem: NSStatusItem?
+    private var loginItem: NSMenuItem?
     private var sliders: [SliderItemView] = []
     private var enabledItem: NSMenuItem!
     private var hideItem: NSMenuItem!
@@ -316,12 +318,12 @@ final class Controller: NSObject, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
 
-        enabledItem = NSMenuItem(title: "Attivo", action: #selector(toggleEnabled), keyEquivalent: "")
+        enabledItem = NSMenuItem(title: "Enabled", action: #selector(toggleEnabled), keyEquivalent: "")
         enabledItem.target = self
         enabledItem.state = s.enabled ? .on : .off
         menu.addItem(enabledItem)
 
-        hideItem = NSMenuItem(title: "Nascondi cursore reale", action: #selector(toggleHide), keyEquivalent: "")
+        hideItem = NSMenuItem(title: "Hide real cursor", action: #selector(toggleHide), keyEquivalent: "")
         hideItem.target = self
         hideItem.state = s.hideCursor ? .on : .off
         menu.addItem(hideItem)
@@ -330,17 +332,17 @@ final class Controller: NSObject, NSMenuDelegate {
 
         let int: (Double) -> String = { "\(Int($0.rounded()))" }
         sliders = [
-            SliderItemView(title: "Intensità", min: 0.2, max: 2.0,
+            SliderItemView(title: "Strength", min: 0.2, max: 2.0,
                            format: { String(format: "%.2f", $0) },
                            get: { s.strength }, set: { s.strength = $0 }),
-            SliderItemView(title: "Durata scia (frame)", min: 1, max: 6, format: int,
+            SliderItemView(title: "Trail length (frames)", min: 1, max: 6, format: int,
                            get: { Double(s.frames) }, set: { s.frames = Int($0.rounded()) }),
-            SliderItemView(title: "Campioni", min: 4, max: 48, format: int,
+            SliderItemView(title: "Samples", min: 4, max: 48, format: int,
                            get: { Double(s.samples) }, set: { s.samples = Int($0.rounded()) }),
-            SliderItemView(title: "Sfumatura coda", min: 0, max: 1,
+            SliderItemView(title: "Head bias", min: 0, max: 1,
                            format: { "\(Int(($0 * 100).rounded()))%" },
                            get: { s.headBias }, set: { s.headBias = $0 }),
-            SliderItemView(title: "Soglia movimento (pt)", min: 0, max: 10,
+            SliderItemView(title: "Movement threshold (pt)", min: 0, max: 10,
                            format: { String(format: "%.1f", $0) },
                            get: { s.minDistance }, set: { s.minDistance = $0 }),
         ]
@@ -352,16 +354,32 @@ final class Controller: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        let reset = NSMenuItem(title: "Ripristina valori predefiniti", action: #selector(resetDefaults), keyEquivalent: "")
+        if Bundle.main.bundleIdentifier != nil {
+            loginItem = NSMenuItem(title: "Launch at login", action: #selector(toggleLogin), keyEquivalent: "")
+            loginItem?.target = self
+            loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+            menu.addItem(loginItem!)
+        }
+        let reset = NSMenuItem(title: "Reset to defaults", action: #selector(resetDefaults), keyEquivalent: "")
         reset.target = self
         menu.addItem(reset)
 
-        let quit = NSMenuItem(title: "Esci", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit cursorblur", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         menu.addItem(quit)
 
         item.menu = menu
         statusItem = item
+    }
+
+    @objc private func toggleLogin() {
+        let svc = SMAppService.mainApp
+        do {
+            if svc.status == .enabled { try svc.unregister() } else { try svc.register() }
+        } catch {
+            NSLog("cursorblur: launch at login failed: \(error)")
+        }
+        loginItem?.state = svc.status == .enabled ? .on : .off
     }
 
     @objc private func toggleEnabled() {
