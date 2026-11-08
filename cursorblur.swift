@@ -116,21 +116,27 @@ enum Trail {
     }
 
     /// Draws ghost copies of the cursor along `pts` (oldest → newest).
-    /// `sharpHead` adds a fully opaque cursor at the newest position.
+    /// `includeHead`: the drawn cursor stands in for the (hidden) real one. While it
+    /// moves, the head dissolves into the blur like a real motion-blurred object;
+    /// once it stops, it is drawn sharp. Without it, the real cursor is the head.
     static func draw(in ctx: CGContext, points pts: [CGPoint], cursor c: CursorSnapshot,
-                     samples: Int, strength: Double, headBias: Double, sharpHead: Bool) {
+                     samples: Int, strength: Double, headBias: Double, includeHead: Bool) {
         guard let img = c.image, let head = pts.last else { return }
         func stamp(_ p: CGPoint, _ a: CGFloat) { ctx.setAlpha(a); ctx.draw(img, in: rect(at: p, c)) }
 
         let n = max(2, samples)
         let k = pts.count - 1
+        var lastSegmentDrawn = false
         if k >= 1 {
             let base = min(1, CGFloat(strength) * 2 / CGFloat(n))
             let bias = CGFloat(headBias)
             for j in 0..<k {
                 let a = pts[j], b = pts[j + 1]
                 if hypot(b.x - a.x, b.y - a.y) < 0.5 { continue }
-                for i in 0..<n {                       // i/n < 1: the head is never a ghost
+                let isLast = j == k - 1
+                if isLast { lastSegmentDrawn = true }
+                let count = isLast && includeHead ? n + 1 : n   // i == n is the head itself
+                for i in 0..<count {
                     let tl = CGFloat(i) / CGFloat(n)
                     let p = CGPoint(x: a.x + (b.x - a.x) * tl, y: a.y + (b.y - a.y) * tl)
                     let tg = (CGFloat(j) + tl) / CGFloat(k)
@@ -138,7 +144,7 @@ enum Trail {
                 }
             }
         }
-        if sharpHead { stamp(head, 1) }
+        if includeHead && !lastSegmentDrawn { stamp(head, 1) }
         ctx.setAlpha(1)
     }
 }
@@ -191,7 +197,7 @@ final class BlurView: NSView {
         // Without "hide real cursor" the head is the real cursor: never draw over it.
         Trail.draw(in: ctx, points: moving ? pts : [head], cursor: cursor,
                    samples: s.samples, strength: s.strength, headBias: s.headBias,
-                   sharpHead: hide)
+                   includeHead: hide)
     }
 }
 
@@ -530,8 +536,13 @@ final class PreviewRow: NSView {
         let moving = s.enabled && length >= CGFloat(s.minDistance)
         ctx.saveGState()
         ctx.clip(to: area.insetBy(dx: 1, dy: 1))
+        let hide = s.enabled && s.hideCursor
         Trail.draw(in: ctx, points: moving ? history : [head], cursor: cursor,
-                   samples: s.samples, strength: s.strength, headBias: s.headBias, sharpHead: true)
+                   samples: s.samples, strength: s.strength, headBias: s.headBias, includeHead: hide)
+        if !hide {                                   // stand-in for the real, sharp cursor
+            Trail.draw(in: ctx, points: [head], cursor: cursor,
+                       samples: s.samples, strength: s.strength, headBias: s.headBias, includeHead: true)
+        }
         ctx.restoreGState()
     }
 }
@@ -827,6 +838,7 @@ final class Controller: NSObject, NSMenuDelegate {
         enabledItem.state = s.enabled ? .on : .off
         item(title: s.enabled ? "◐" : "○")
         latencyRow.refresh()
+        preview.needsDisplay = true
         applyCursorVisibility()
     }
 
