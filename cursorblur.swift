@@ -17,7 +17,7 @@ final class Settings {
     private let d = UserDefaults.standard
 
     static let factory: [String: Any] = [
-        "samples": 11,        // ghost copies per frame segment
+        "samples": 11,        // density: one copy every 16/11 ≈ 1.5 pt of travel
         "strength": 0.99,     // overall trail opacity
         "headBias": 0.56,     // 0 = uniform trail, 1 = fades toward the tail
         "minDistance": 10.0,  // movement (pt) below which no trail is drawn
@@ -117,26 +117,54 @@ enum Trail {
                width: c.size.width, height: c.size.height)
     }
 
+    /// Rendering variant, switchable only for the comparison render (CURSORBLUR_RENDER_TRAILS).
+    enum Mode { case fixed, adaptive }
+    static var mode: Mode = .adaptive
+    /// Hard cap on copies per frame segment, to bound GPU work on extreme flicks.
+    static let maxCopies = 128
+
+    /// Distance between ghost copies (pt) for a given Density setting (4…48).
+    /// Copies stay evenly spaced, so fast flicks get more of them (no comb effect)
+    /// and slow moves fewer (no muddy pile-up).
+    static func spacing(density: Int) -> CGFloat { 16 / CGFloat(max(1, density)) }
+
     /// Draws ghost copies of the cursor along `pts` (oldest → newest).
     /// `includeHead`: the drawn cursor stands in for the (hidden) real one. While it
     /// moves, the head dissolves into the blur like a real motion-blurred object;
     /// once it stops, it is drawn sharp. Without it, the real cursor is the head.
+    /// `minDistance`: path length at which the trail starts; it fades in above it.
     static func draw(in ctx: CGContext, points pts: [CGPoint], cursor c: CursorSnapshot,
-                     samples: Int, strength: Double, headBias: Double, includeHead: Bool) {
+                     samples: Int, strength: Double, headBias: Double, includeHead: Bool,
+                     minDistance: Double = 0) {
         guard let img = c.image, let head = pts.last else { return }
         func stamp(_ p: CGPoint, _ a: CGFloat) { ctx.setAlpha(a); ctx.draw(img, in: rect(at: p, c)) }
 
-        let n = max(2, samples)
+        let maxN = max(2, samples)
+        let gap = spacing(density: samples)
         let k = pts.count - 1
         var lastSegmentDrawn = false
-        if k >= 1 {
-            let base = min(1, CGFloat(strength) * 2 / CGFloat(n))
+        // Fade the trail in over a range above the threshold instead of switching it on.
+        var fade: CGFloat = 1
+        if mode == .adaptive && k >= 1 {
+            var total: CGFloat = 0
+            for j in 0..<k { total += hypot(pts[j + 1].x - pts[j].x, pts[j + 1].y - pts[j].y) }
+            let lo = CGFloat(minDistance), hi = lo + 16
+            let u = min(1, max(0, (total - lo) / (hi - lo)))
+            fade = u * u * (3 - 2 * u)                       // smoothstep
+        }
+        if k >= 1 && fade > 0 {
             let bias = CGFloat(headBias)
             for j in 0..<k {
                 let a = pts[j], b = pts[j + 1]
-                if hypot(b.x - a.x, b.y - a.y) < 0.5 { continue }
+                let len = hypot(b.x - a.x, b.y - a.y)
+                if len < 0.5 { continue }
                 let isLast = j == k - 1
                 if isLast { lastSegmentDrawn = true }
+                let n = mode == .fixed ? maxN : min(maxCopies, max(2, Int((len / gap).rounded(.up))))
+                // Long, fast segments spread the same opacity over more copies; cap the
+                // dilution so quick flicks stay as visible as in fixed mode.
+                let alphaN = mode == .fixed ? n : min(n, 2 * maxN)
+                let base = min(1, CGFloat(strength) * 2 / CGFloat(alphaN)) * fade
                 let count = isLast && includeHead ? n + 1 : n   // i == n is the head itself
                 for i in 0..<count {
                     let tl = CGFloat(i) / CGFloat(n)
@@ -147,6 +175,7 @@ enum Trail {
             }
         }
         if includeHead && !lastSegmentDrawn { stamp(head, 1) }
+        else if includeHead && fade < 1 { stamp(head, 1 - fade) }   // still mostly sharp
         ctx.setAlpha(1)
     }
 }
@@ -199,7 +228,7 @@ final class BlurView: NSView {
         // Without "hide real cursor" the head is the real cursor: never draw over it.
         Trail.draw(in: ctx, points: moving ? pts : [head], cursor: cursor,
                    samples: s.samples, strength: s.strength, headBias: s.headBias,
-                   includeHead: hide)
+                   includeHead: hide, minDistance: s.minDistance)
     }
 }
 
@@ -540,7 +569,8 @@ final class PreviewRow: NSView {
         ctx.clip(to: area.insetBy(dx: 1, dy: 1))
         let hide = s.enabled && s.hideCursor
         Trail.draw(in: ctx, points: moving ? history : [head], cursor: cursor,
-                   samples: s.samples, strength: s.strength, headBias: s.headBias, includeHead: hide)
+                   samples: s.samples, strength: s.strength, headBias: s.headBias, includeHead: hide,
+                   minDistance: s.minDistance)
         if !hide {                                   // stand-in for the real, sharp cursor
             Trail.draw(in: ctx, points: [head], cursor: cursor,
                        samples: s.samples, strength: s.strength, headBias: s.headBias, includeHead: true)
@@ -619,6 +649,9 @@ final class Controller: NSObject, NSMenuDelegate {
         setupMenu()
         if let path = ProcessInfo.processInfo.environment["CURSORBLUR_RENDER_MENU"] {
             renderMenu(to: path); exit(0)
+        }
+        if let path = ProcessInfo.processInfo.environment["CURSORBLUR_RENDER_TRAILS"] {
+            renderTrailComparison(to: path); exit(0)
         }
         buildWindows()
         setupSignals()
@@ -804,8 +837,9 @@ final class Controller: NSObject, NSMenuDelegate {
                               "Smears the last \(n) frame\(n == 1 ? "" : "s") (\(Timing.ms(Double(n) * Timing.frameMs)) ms) of motion. The pointer isn't delayed.")
                       },
                       get: { Double(s.frames) }, set: { s.frames = Int($0.rounded()) }),
-            SliderRow(title: "Samples", kind: .samples, min: 4, max: 48, format: int,
-                      caption: { _ in captionText(latency: ok, ok: true, "Copies drawn per frame: smoother trail, more GPU work.") },
+            SliderRow(title: "Density", kind: .samples, min: 4, max: 48, format: int,
+                      caption: { v in captionText(latency: ok, ok: true,
+                          "A copy every \(String(format: "%.1f", Trail.spacing(density: Int(v.rounded())))) pt: fast moves get more copies, slow ones fewer.") },
                       get: { Double(s.samples) }, set: { s.samples = Int($0.rounded()) }),
             SliderRow(title: "Head bias", kind: .bias, min: 0, max: 1,
                       format: { "\(Int(($0 * 100).rounded()))%" },
@@ -813,7 +847,7 @@ final class Controller: NSObject, NSMenuDelegate {
                       get: { s.headBias }, set: { s.headBias = $0 }),
             SliderRow(title: "Movement threshold", kind: .threshold, min: 0, max: 10,
                       format: { String(format: "%.1f pt", $0) },
-                      caption: { _ in captionText(latency: ok, ok: true, "Smaller movements draw no trail, so the cursor stays crisp when still.") },
+                      caption: { _ in captionText(latency: ok, ok: true, "Below this the cursor stays crisp; above it the trail fades in.") },
                       get: { s.minDistance }, set: { s.minDistance = $0 }),
         ]
     }
@@ -889,6 +923,48 @@ final class Controller: NSObject, NSMenuDelegate {
         let rep = container.bitmapImageRepForCachingDisplay(in: container.bounds)!
         container.cacheDisplay(in: container.bounds, to: rep)
         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+    }
+
+    /// Debug aid: the trail at several speeds, fixed density (left) vs adaptive (right).
+    private func renderTrailComparison(to path: String) {
+        let s = Settings.shared
+        let speeds: [CGFloat] = [3, 5, 7, 10, 15, 25, 40, 70]       // pt per frame
+        let scale: CGFloat = 2, rowH: CGFloat = 70, colW: CGFloat = 330, labelW: CGFloat = 90
+        let W = Int((labelW + colW * 2) * scale), H = Int((rowH * CGFloat(speeds.count) + 30) * scale)
+        let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.scaleBy(x: scale, y: scale)
+        ctx.setFillColor(CGColor(red: 0.16, green: 0.18, blue: 0.25, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(W), height: CGFloat(H)))
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                                                    .foregroundColor: NSColor(white: 1, alpha: 0.7)]
+        let top = rowH * CGFloat(speeds.count) + 30
+        NSAttributedString(string: "v0.1.0: fixed copies per frame", attributes: attrs).draw(at: NSPoint(x: labelW + 10, y: top - 20))
+        NSAttributedString(string: "after: adaptive density + fade-in", attributes: attrs).draw(at: NSPoint(x: labelW + colW + 10, y: top - 20))
+        let cursor = CursorSnapshot.of(.arrow)
+        for (r, v) in speeds.enumerated() {
+            let y = top - 30 - rowH * CGFloat(r) - rowH / 2 + cursor.size.height / 2
+            let pps = Int((v * CGFloat(Timing.hz)).rounded())
+            NSAttributedString(string: "\(Int(v)) pt/frame\n\(pps) pt/s", attributes: attrs)
+                .draw(at: NSPoint(x: 10, y: y - cursor.size.height / 2 - 6))
+            for (col, mode) in [Trail.Mode.fixed, .adaptive].enumerated() {
+                let headX = labelW + colW * CGFloat(col) + colW - 60
+                let n = max(1, s.frames)
+                let pts = (0...n).map { CGPoint(x: headX - v * CGFloat(n - $0), y: y) }
+                let length = v * CGFloat(n)
+                Trail.mode = mode
+                let moving = length >= CGFloat(s.minDistance)
+                Trail.draw(in: ctx, points: moving ? pts : [pts.last!], cursor: cursor,
+                           samples: s.samples, strength: s.strength, headBias: s.headBias,
+                           includeHead: true, minDistance: s.minDistance)
+            }
+        }
+        Trail.mode = .adaptive
+        NSGraphicsContext.restoreGraphicsState()
+        try? NSBitmapImageRep(cgImage: ctx.makeImage()!).representation(using: .png, properties: [:])?
+            .write(to: URL(fileURLWithPath: path))
     }
 
     @objc private func cleanup() {

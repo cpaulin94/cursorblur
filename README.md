@@ -61,9 +61,9 @@ slider, and how much latency each one adds.
 |---|---|---|
 | Strength | Opacity of the trail | 0 ms |
 | Trail length | How many past frames are smeared (1 frame = 8.3 ms at 120 Hz) | 0 ms. The trail covers past motion; the pointer itself is not delayed |
-| Samples | Copies drawn per frame: smoother trail, more GPU work | 0 ms |
+| Density | Spacing of the copies along the path (11 ≈ one every 1.5 pt): fast moves get more copies, slow ones fewer, so the trail stays smooth without turning muddy | 0 ms |
 | Head bias | Fades the trail toward its tail | 0 ms |
-| Movement threshold | Movements below this draw no trail | 0 ms |
+| Movement threshold | Below this the cursor stays sharp; above it the trail fades in gradually | 0 ms |
 | Hide real cursor | Shows only the cursor drawn by cursorblur | **1–2 frames** (≈ 8–17 ms at 120 Hz, 17–33 ms at 60 Hz) |
 | Launch at login | Starts cursorblur automatically (app bundle only) | — |
 
