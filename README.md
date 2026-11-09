@@ -2,9 +2,24 @@
 
 Real-time motion blur for the macOS mouse cursor — runs at your display's refresh rate (120 Hz on ProMotion).
 
-A single-file AppKit app (`cursorblur.swift`, ~400 lines, no Xcode project) that draws interpolated, fading copies of the current system cursor along its recent path, in a transparent click-through overlay on every screen.
+<p align="center"><img src="docs/demo.gif" alt="cursorblur demo: the cursor leaves a motion-blurred trail as it moves" width="720"></p>
 
-## Quick start
+A single-file AppKit app (`cursorblur.swift`, no Xcode project) that hides the real cursor and redraws it with motion blur along its recent path, in a transparent click-through overlay on every screen.
+
+## Install
+
+1. Download **cursorblur-x.y.z.zip** from the [latest release](https://github.com/cpaulin94/cursorblur/releases/latest), unzip it and move **cursorblur.app** to Applications.
+2. Open it. The release isn't notarized yet, so the first time macOS blocks it: go to **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. Or, from Terminal:
+
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/cursorblur.app && open /Applications/cursorblur.app
+   ```
+
+3. Use the **◐** icon in the menu bar for settings, **Launch at login** and Quit.
+
+Universal app (Apple silicon and Intel), macOS 14 or later.
+
+## Build from source
 
 ```bash
 git clone https://github.com/cpaulin94/cursorblur.git && cd cursorblur && ./build.sh run
@@ -14,7 +29,6 @@ Build commands:
 
 ```bash
 ./build.sh run          # build and launch from the terminal
-./build.sh run --hide   # same, with the real cursor hidden (blur only)
 ./build.sh app          # build build/cursorblur.app (universal: Apple silicon + Intel)
 ./build.sh release      # build, sign, notarize (if configured) and zip for distribution
 ```

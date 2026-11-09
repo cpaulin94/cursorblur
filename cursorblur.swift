@@ -17,12 +17,12 @@ final class Settings {
     private let d = UserDefaults.standard
 
     static let factory: [String: Any] = [
-        "samples": 24,        // copie interpolate per segmento
-        "strength": 1.0,      // intensità complessiva
-        "headBias": 0.6,      // 0 = scia uniforme, 1 = sfuma verso la coda
-        "minDistance": 1.5,   // soglia di movimento in punti
-        "frames": 1,          // quanti frame passati copre la scia ("tempo di otturazione")
-        "hideCursor": false,
+        "samples": 11,        // ghost copies per frame segment
+        "strength": 0.99,     // overall trail opacity
+        "headBias": 0.56,     // 0 = uniform trail, 1 = fades toward the tail
+        "minDistance": 10.0,  // movement (pt) below which no trail is drawn
+        "frames": 2,          // past frames covered by the trail ("shutter")
+        "hideCursor": true,   // show only the motion-blurred cursor
         "enabled": true,
     ]
 
@@ -47,8 +47,10 @@ final class Settings {
     }
 
     func reset() {
-        samples = 24; strength = 1.0; headBias = 0.6
-        minDistance = 1.5; frames = 1; hideCursor = false
+        let f = Settings.factory
+        samples = f["samples"] as! Int; strength = f["strength"] as! Double
+        headBias = f["headBias"] as! Double; minDistance = f["minDistance"] as! Double
+        frames = f["frames"] as! Int; hideCursor = f["hideCursor"] as! Bool
     }
 }
 
@@ -853,7 +855,7 @@ final class Controller: NSObject, NSMenuDelegate {
     @objc private func resetDefaults() {
         Settings.shared.reset()
         sliders.forEach { $0.reload() }
-        hideItem.state = .off
+        hideItem.state = Settings.shared.hideCursor ? .on : .off
         latencyRow.refresh()
         applyCursorVisibility()
     }
