@@ -82,6 +82,12 @@ Settings persist in `UserDefaults`.
 - The view draws N copies of `NSCursor.currentSystem` (respecting its hot spot) interpolated along that history, invalidating only the dirty rect.
 - "Hide real cursor" uses the private `CGSSetConnectionProperty("SetsCursorInBackground")` + `CGDisplayHideCursor`, with balanced hide counts so the cursor is always restored on Quit, SIGINT/SIGTERM and app termination.
 
+## Engineering notes
+
+The issues found while hardening cursorblur, from App Nap throttling to a slider that
+lost its mouse-up inside a menu, each with its cause, fix and how it was verified:
+[docs/engineering-notes.md](docs/engineering-notes.md).
+
 ## Roadmap
 
 - Notarized binary on GitHub Releases / Homebrew cask
