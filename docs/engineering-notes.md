@@ -1,6 +1,6 @@
 # Engineering notes
 
-How cursorblur got from a working prototype to v0.1.1: the issues found while using it
+How cursorblur got from a working prototype to v0.1.2: the issues found while using it
 every day, what caused them, and how each fix was verified.
 
 Most of these never showed up in a quick test. They appeared only in a packaged app,
@@ -9,6 +9,37 @@ at the edge of a control, or at one specific mouse speed.
 ---
 
 ## Rendering
+
+### Fast circles drawn as polygons · v0.1.2
+
+**Symptom.** Drawing very fast circles, the trail traced a polygon instead of a round
+curve.
+
+**Cause.** The pointer was sampled once per display frame and the samples were joined
+with straight lines. At 6 turns/s and 120 Hz the cursor covers 18° between two frames.
+Each frame's trail was a straight chord, and the eye adds the frames together into a
+polygon.
+
+**Fix.**
+- **More real samples.** Mouse and trackpad events between frames are recorded with
+  their timestamps and merged with the per-frame samples into one time-ordered buffer.
+  Mouse-moved events need no permission, unlike key events.
+- **A curve through them.** A centripetal Catmull-Rom spline passes through every sample
+  without loops or overshoot. At the newest end, the tangent comes from quadratic
+  extrapolation of the previous samples, so the curve bends toward the head without
+  waiting for a future sample.
+- **Even copies along the curve.** Copies are placed by arc length along the curve,
+  with the same density and opacity rules as before.
+
+No latency is added: only past samples are used, and the head is still the latest
+pointer position.
+
+**Verified.** A one-turn long exposure (every frame of one turn, overlaid as the eye
+integrates them) at 3 and 6 turns/s. Left to right: straight segments, spline through
+the per-frame samples, spline through 1 kHz events. On the installed app: 120 fps, with
+pointer events arriving without any permission and matching the pointer position.
+
+![One-turn long exposure of fast circles: straight segments (left), spline (centre), spline with 1 kHz events (right)](fast-circles.png)
 
 ### Muddy trail at slow speeds, broken trail on fast flicks · v0.1.1
 
@@ -28,7 +59,7 @@ outlines covered the white fill. On a 70 pt flick the same 11 copies were 6 pt a
   once, so slow, precise moves keep the cursor sharp.
 
 **Verified.** An offscreen render of the trail at eight speeds, old algorithm against
-new (`CURSORBLUR_RENDER_TRAILS=out.png`):
+new:
 
 ![Trail at 3–70 pt per frame: fixed copies per frame (left) and adaptive density (right)](trail-density.png)
 
@@ -130,8 +161,8 @@ why hiding the real cursor is the default.
 
 ## Tooling
 
-- `CURSORBLUR_DEBUG=1`: logs the render rate once a second.
+- `CURSORBLUR_DEBUG=1`: logs the render rate and pointer event rate once a second.
 - `CURSORBLUR_RENDER_MENU=out.png`: renders the menu rows offscreen.
-- `CURSORBLUR_RENDER_TRAILS=out.png`: renders the before/after trail comparison.
+- `CURSORBLUR_RENDER_TRAILS=out.png`: renders the fast-circle long-exposure comparison.
 - `./build.sh release`: universal binary, Info.plist, signing (ad-hoc or Developer ID),
   optional notarization, zip and checksum.

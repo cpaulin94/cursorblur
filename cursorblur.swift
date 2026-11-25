@@ -118,8 +118,84 @@ enum Trail {
     }
 
     /// Rendering variant, switchable only for the comparison render (CURSORBLUR_RENDER_TRAILS).
-    enum Mode { case fixed, adaptive }
-    static var mode: Mode = .adaptive
+    /// `.fixed` = v0.1.0, `.adaptive` = v0.1.1 (straight segments), `.spline` = current.
+    enum Mode { case fixed, adaptive, spline }
+    static var mode: Mode = .spline
+
+    // MARK: Curved path
+
+    /// Turns a few samples into a dense curve with a centripetal Catmull-Rom spline,
+    /// which passes through every sample without loops or overshoot on sharp turns.
+    /// The end tangents are extrapolated from the samples themselves (quadratic), so
+    /// the segment leading to the head bends like the path before it without waiting
+    /// for a future sample: no added latency.
+    static func smooth(_ raw: [CGPoint], step: CGFloat = 1.5) -> [CGPoint] {
+        var q: [CGPoint] = []
+        for p in raw where q.last.map({ hypot(p.x - $0.x, p.y - $0.y) >= 0.25 }) ?? true { q.append(p) }
+        if let last = raw.last, let ql = q.last, ql != last { q[q.count - 1] = last }   // keep the exact head
+        guard q.count >= 3 else { return q }
+
+        func lerp(_ a: CGPoint, _ b: CGPoint, _ ta: CGFloat, _ tb: CGFloat, _ t: CGFloat) -> CGPoint {
+            let d = tb - ta
+            guard d > 1e-6 else { return a }
+            return CGPoint(x: a.x * (tb - t) / d + b.x * (t - ta) / d, y: a.y * (tb - t) / d + b.y * (t - ta) / d)
+        }
+        func knot(_ a: CGPoint, _ b: CGPoint) -> CGFloat { max(1e-3, sqrt(hypot(b.x - a.x, b.y - a.y))) }
+
+        var out = [q[0]]
+        let n = q.count
+        for i in 0..<(n - 1) {
+            let p1 = q[i], p2 = q[i + 1]
+            // Phantom neighbours past the ends: quadratic extrapolation keeps the curvature.
+            let p0 = i > 0 ? q[i - 1]
+                : CGPoint(x: 3 * p1.x - 3 * p2.x + q[2].x, y: 3 * p1.y - 3 * p2.y + q[2].y)
+            let p3 = i + 2 < n ? q[i + 2]
+                : CGPoint(x: 3 * p2.x - 3 * p1.x + q[i - 1].x, y: 3 * p2.y - 3 * p1.y + q[i - 1].y)
+            let t0: CGFloat = 0, t1 = t0 + knot(p0, p1), t2 = t1 + knot(p1, p2), t3 = t2 + knot(p2, p3)
+            let m = min(32, max(1, Int((hypot(p2.x - p1.x, p2.y - p1.y) / step).rounded(.up))))
+            for j in 1...m {
+                let t = t1 + (t2 - t1) * CGFloat(j) / CGFloat(m)
+                let a1 = lerp(p0, p1, t0, t1, t), a2 = lerp(p1, p2, t1, t2, t), a3 = lerp(p2, p3, t2, t3, t)
+                let b1 = lerp(a1, a2, t0, t2, t), b2 = lerp(a2, a3, t1, t3, t)
+                out.append(j == m ? p2 : lerp(b1, b2, t1, t2, t))
+            }
+        }
+        return out
+    }
+
+    /// Ghost copies evenly spaced by arc length along a dense path (oldest → newest).
+    /// `frames`: how many display frames the path spans, so opacity per frame of motion
+    /// matches the straight-segment renderer.
+    private static func drawPath(in ctx: CGContext, path: [CGPoint], frames: Int, cursor c: CursorSnapshot,
+                                 samples: Int, strength: Double, headBias: Double, includeHead: Bool,
+                                 minDistance: Double, stamp: (CGPoint, CGFloat) -> Void) {
+        guard let head = path.last else { return }
+        var cum: [CGFloat] = [0]
+        for (a, b) in zip(path, path.dropFirst()) { cum.append(cum.last! + hypot(b.x - a.x, b.y - a.y)) }
+        let total = cum.last!
+        let lo = CGFloat(minDistance), hi = lo + 16
+        let u = min(1, max(0, (total - lo) / (hi - lo)))
+        let fade = u * u * (3 - 2 * u)
+        guard total >= 0.5, fade > 0 else { if includeHead { stamp(head, 1) }; return }
+
+        let maxN = max(2, samples)
+        let perFrame = CGFloat(max(1, frames))
+        let count = min(maxCopies * max(1, frames), max(2, Int((total / spacing(density: samples)).rounded(.up))))
+        let alphaN = min(CGFloat(count), 2 * CGFloat(maxN) * perFrame)
+        let base = min(1, CGFloat(strength) * 2 * perFrame / alphaN) * fade
+        let bias = CGFloat(headBias)
+        var seg = 0
+        for i in 0..<(includeHead ? count + 1 : count) {
+            let f = CGFloat(i) / CGFloat(count)
+            let d = f * total
+            while seg < path.count - 2 && cum[seg + 1] < d { seg += 1 }
+            let span = cum[seg + 1] - cum[seg]
+            let k = span > 0 ? (d - cum[seg]) / span : 0
+            let a = path[seg], b = path[seg + 1]
+            stamp(CGPoint(x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k), base * ((1 - bias) + bias * f))
+        }
+        if includeHead && fade < 1 { stamp(head, 1 - fade) }
+    }
     /// Hard cap on copies per frame segment, to bound GPU work on extreme flicks.
     static let maxCopies = 128
 
@@ -135,9 +211,17 @@ enum Trail {
     /// `minDistance`: path length at which the trail starts; it fades in above it.
     static func draw(in ctx: CGContext, points pts: [CGPoint], cursor c: CursorSnapshot,
                      samples: Int, strength: Double, headBias: Double, includeHead: Bool,
-                     minDistance: Double = 0) {
+                     minDistance: Double = 0, frames: Int? = nil) {
         guard let img = c.image, let head = pts.last else { return }
         func stamp(_ p: CGPoint, _ a: CGFloat) { ctx.setAlpha(a); ctx.draw(img, in: rect(at: p, c)) }
+        if mode == .spline {
+            // `pts` is already a dense path (see `smooth`).
+            drawPath(in: ctx, path: pts, frames: frames ?? max(1, pts.count - 1), cursor: c,
+                     samples: samples, strength: strength, headBias: headBias, includeHead: includeHead,
+                     minDistance: minDistance, stamp: stamp)
+            ctx.setAlpha(1)
+            return
+        }
 
         let maxN = max(2, samples)
         let gap = spacing(density: samples)
@@ -203,16 +287,21 @@ final class BlurView: NSView {
     override var isOpaque: Bool { false }
 
     /// `global`: positions from oldest to newest, in global coordinates.
-    func update(points global: [CGPoint], moving: Bool, hide: Bool, cursor: CursorSnapshot) {
+    private var frames = 1
+
+    func update(points global: [CGPoint], frames: Int, moving: Bool, hide: Bool, cursor: CursorSnapshot) {
         pts = global.map { CGPoint(x: $0.x - screenOrigin.x, y: $0.y - screenOrigin.y) }
+        self.frames = frames
         self.moving = moving
         self.hide = hide
         self.cursor = cursor
 
         var dirty = NSRect.zero
         if moving || hide, cursor.image != nil, let head = pts.last {
-            let rects = moving ? pts.map { Trail.rect(at: $0, cursor) } : [Trail.rect(at: head, cursor)]
-            dirty = rects.dropFirst().reduce(rects[0]) { $0.union($1) }
+            let span = moving ? pts : [head]
+            let lo = CGPoint(x: span.map(\.x).min()!, y: span.map(\.y).min()!)
+            let hi = CGPoint(x: span.map(\.x).max()!, y: span.map(\.y).max()!)
+            dirty = Trail.rect(at: lo, cursor).union(Trail.rect(at: hi, cursor))
                 .insetBy(dx: -2, dy: -2).intersection(bounds)
         }
         let toInvalidate = dirty.union(lastDirty)
@@ -228,7 +317,7 @@ final class BlurView: NSView {
         // Without "hide real cursor" the head is the real cursor: never draw over it.
         Trail.draw(in: ctx, points: moving ? pts : [head], cursor: cursor,
                    samples: s.samples, strength: s.strength, headBias: s.headBias,
-                   includeHead: hide, minDistance: s.minDistance)
+                   includeHead: hide, minDistance: s.minDistance, frames: frames)
     }
 }
 
@@ -568,9 +657,9 @@ final class PreviewRow: NSView {
         ctx.saveGState()
         ctx.clip(to: area.insetBy(dx: 1, dy: 1))
         let hide = s.enabled && s.hideCursor
-        Trail.draw(in: ctx, points: moving ? history : [head], cursor: cursor,
+        Trail.draw(in: ctx, points: moving ? Trail.smooth(history) : [head], cursor: cursor,
                    samples: s.samples, strength: s.strength, headBias: s.headBias, includeHead: hide,
-                   minDistance: s.minDistance)
+                   minDistance: s.minDistance, frames: max(1, s.frames))
         if !hide {                                   // stand-in for the real, sharp cursor
             Trail.draw(in: ctx, points: [head], cursor: cursor,
                        samples: s.samples, strength: s.strength, headBias: s.headBias, includeHead: true)
@@ -623,7 +712,13 @@ final class Controller: NSObject, NSMenuDelegate {
     private var views: [BlurView] = []
     private var windows: [NSWindow] = []
     private var link: CADisplayLink?
-    private var history: [CGPoint] = [NSEvent.mouseLocation]
+    /// Timestamped pointer positions (system uptime), oldest first: one per display
+    /// frame plus every mouse/trackpad event in between, which records the real path
+    /// between frames when the hardware reports faster than the display refreshes.
+    private var events: [(p: CGPoint, t: TimeInterval)] = []
+    private var eventMonitors: [Any] = []
+    private var debugEvents = 0
+    private var debugMaxOffset: CGFloat = 0
     private var statusItem: NSStatusItem?
     private var loginItem: NSMenuItem?
     private var sliders: [SliderRow] = []
@@ -654,6 +749,7 @@ final class Controller: NSObject, NSMenuDelegate {
             renderTrailComparison(to: path); exit(0)
         }
         buildWindows()
+        startEventSampling()
         setupSignals()
         applyCursorVisibility()
 
@@ -698,18 +794,63 @@ final class Controller: NSObject, NSMenuDelegate {
         }
     }
 
+    /// Mouse-moved events need no permission (only key events do). Global events
+    /// cover other apps; the local monitor covers our own menu.
+    private func startEventSampling() {
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        if let g = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] e in self?.record(e) }) {
+            eventMonitors.append(g)
+        }
+        if let l = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] e in self?.record(e); return e }) {
+            eventMonitors.append(l)
+        }
+    }
+
+    private func record(_ e: NSEvent) {
+        // Global events have no window: locationInWindow is already in screen coordinates.
+        let p = e.window.map { $0.convertPoint(toScreen: e.locationInWindow) } ?? e.locationInWindow
+        insert(p, at: e.timestamp)
+        debugEvents += 1
+        if debug { debugMaxOffset = max(debugMaxOffset, hypot(p.x - NSEvent.mouseLocation.x, p.y - NSEvent.mouseLocation.y)) }
+        if events.count > 2048 { events.removeFirst(events.count - 1024) }
+    }
+
+    /// Events are delivered a little after they happen, so they may land before the
+    /// latest frame sample: keep the buffer sorted by time.
+    private func insert(_ p: CGPoint, at t: TimeInterval) {
+        var i = events.count
+        while i > 0 && events[i - 1].t > t { i -= 1 }
+        if i > 0 && events[i - 1].t == t { return }
+        events.insert((p, t), at: i)
+        if events.count > 4096 { events.removeFirst(events.count - 2048) }
+    }
+
+    /// The path covered during the "shutter" (the last `frames` display frames), oldest
+    /// first, ending exactly at the current pointer position.
+    private func shutterPath(frames: Int, head: CGPoint) -> [CGPoint] {
+        let now = ProcessInfo.processInfo.systemUptime
+        let start = now - Double(frames) / Timing.hz
+        insert(head, at: now)
+        if let cut = events.firstIndex(where: { $0.t >= now - 0.25 }), cut > 0 { events.removeFirst(cut) }
+        guard let firstIn = events.firstIndex(where: { $0.t >= start }) else { return [head] }
+        var path: [CGPoint] = []
+        if firstIn > 0 {                                     // position exactly at shutter open
+            let a = events[firstIn - 1], b = events[firstIn]
+            let k = CGFloat((start - a.t) / max(1e-6, b.t - a.t))
+            path.append(CGPoint(x: a.p.x + (b.p.x - a.p.x) * k, y: a.p.y + (b.p.y - a.p.y) * k))
+        }
+        path += events[firstIn...].filter { $0.t <= now }.map(\.p)
+        if path.last != head { path.append(head) }
+        return path
+    }
+
     @objc private func tick(_ link: CADisplayLink) {
         let s = Settings.shared
-        history.append(NSEvent.mouseLocation)
-        let maxCount = max(1, s.frames) + 1
-        if history.count > maxCount { history.removeFirst(history.count - maxCount) }
+        let head = NSEvent.mouseLocation
 
+        let samples = shutterPath(frames: max(1, s.frames), head: head)
         var length: CGFloat = 0
-        if history.count >= 2 {
-            for i in 1..<history.count {
-                length += hypot(history[i].x - history[i - 1].x, history[i].y - history[i - 1].y)
-            }
-        }
+        for (a, b) in zip(samples, samples.dropFirst()) { length += hypot(b.x - a.x, b.y - a.y) }
         let moving = s.enabled && length >= CGFloat(s.minDistance)
         let hide = s.enabled && s.hideCursor
         tickCount &+= 1
@@ -717,14 +858,16 @@ final class Controller: NSObject, NSMenuDelegate {
             debugFrames += 1
             let now = CACurrentMediaTime()
             if now - debugStart >= 1 {
-                NSLog("cursorblur: %d fps", debugFrames)
-                debugFrames = 0; debugStart = now
+                NSLog("cursorblur: %d fps, %d pointer events/s, max event-vs-pointer offset %.1f pt",
+                      debugFrames, debugEvents, debugMaxOffset)
+                debugFrames = 0; debugEvents = 0; debugMaxOffset = 0; debugStart = now
             }
         }
         // The drawn cursor *is* the cursor in hide mode: refresh its shape every frame.
         if hide || tickCount % 3 == 0 { cursor = CursorSnapshot.current() }
         if hide && tickCount % 15 == 0 { reassertIfShown() }
-        for v in views { v.update(points: history, moving: moving, hide: hide, cursor: cursor) }
+        let path = moving ? Trail.smooth(samples) : samples
+        for v in views { v.update(points: path, frames: max(1, s.frames), moving: moving, hide: hide, cursor: cursor) }
     }
 
     private func hideNow() { hideSystemCursor(); hideCount += 1 }
@@ -925,12 +1068,15 @@ final class Controller: NSObject, NSMenuDelegate {
         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
     }
 
-    /// Debug aid: the trail at several speeds, fixed density (left) vs adaptive (right).
+    /// Debug aid: fast circles rendered three ways. v0.1.1 joins one sample per frame
+    /// with straight lines; v0.1.2 draws a spline through them, and through the extra
+    /// pointer events when the hardware delivers them (simulated here at 1 kHz).
     private func renderTrailComparison(to path: String) {
         let s = Settings.shared
-        let speeds: [CGFloat] = [3, 5, 7, 10, 15, 25, 40, 70]       // pt per frame
-        let scale: CGFloat = 2, rowH: CGFloat = 70, colW: CGFloat = 330, labelW: CGFloat = 90
-        let W = Int((labelW + colW * 2) * scale), H = Int((rowH * CGFloat(speeds.count) + 30) * scale)
+        let cases: [(turns: Double, frames: Int)] = [(3, s.frames), (6, s.frames), (6, 4)]
+        let cols = ["v0.1.1: straight segments", "v0.1.2: spline, frame samples", "v0.1.2: spline + 1 kHz events"]
+        let scale: CGFloat = 2, cell: CGFloat = 230, labelW: CGFloat = 100, header: CGFloat = 34
+        let W = Int((labelW + cell * 3) * scale), H = Int((cell * CGFloat(cases.count) + header) * scale)
         let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
                             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
         ctx.scaleBy(x: scale, y: scale)
@@ -940,28 +1086,48 @@ final class Controller: NSObject, NSMenuDelegate {
         NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
         let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .medium),
                                                     .foregroundColor: NSColor(white: 1, alpha: 0.7)]
-        let top = rowH * CGFloat(speeds.count) + 30
-        NSAttributedString(string: "v0.1.0: fixed copies per frame", attributes: attrs).draw(at: NSPoint(x: labelW + 10, y: top - 20))
-        NSAttributedString(string: "after: adaptive density + fade-in", attributes: attrs).draw(at: NSPoint(x: labelW + colW + 10, y: top - 20))
+        let top = cell * CGFloat(cases.count) + header
+        for (i, c) in cols.enumerated() {
+            NSAttributedString(string: c, attributes: attrs).draw(at: NSPoint(x: labelW + cell * CGFloat(i) + 12, y: top - 22))
+        }
         let cursor = CursorSnapshot.of(.arrow)
-        for (r, v) in speeds.enumerated() {
-            let y = top - 30 - rowH * CGFloat(r) - rowH / 2 + cursor.size.height / 2
-            let pps = Int((v * CGFloat(Timing.hz)).rounded())
-            NSAttributedString(string: "\(Int(v)) pt/frame\n\(pps) pt/s", attributes: attrs)
-                .draw(at: NSPoint(x: 10, y: y - cursor.size.height / 2 - 6))
-            for (col, mode) in [Trail.Mode.fixed, .adaptive].enumerated() {
-                let headX = labelW + colW * CGFloat(col) + colW - 60
-                let n = max(1, s.frames)
-                let pts = (0...n).map { CGPoint(x: headX - v * CGFloat(n - $0), y: y) }
-                let length = v * CGFloat(n)
-                Trail.mode = mode
-                let moving = length >= CGFloat(s.minDistance)
-                Trail.draw(in: ctx, points: moving ? pts : [pts.last!], cursor: cursor,
-                           samples: s.samples, strength: s.strength, headBias: s.headBias,
-                           includeHead: true, minDistance: s.minDistance)
+        let hz = Timing.hz, r: CGFloat = 70
+        for (row, cs) in cases.enumerated() {
+            let cy = top - header - cell * CGFloat(row) - cell / 2
+            let speed = Int((2 * .pi * Double(r) * cs.turns).rounded())
+            NSAttributedString(string: "\(Int(cs.turns)) turns/s\n\(speed) pt/s\ntrail \(cs.frames) fr", attributes: attrs)
+                .draw(at: NSPoint(x: 10, y: cy - 22))
+            let omega = 2 * .pi * cs.turns
+            let perTurn = Int((hz / cs.turns).rounded())         // frames in one turn
+            for col in 0..<3 {
+                let cx = labelW + cell * CGFloat(col) + cell / 2
+                func pos(_ a: Double) -> CGPoint { CGPoint(x: cx + r * CGFloat(cos(a)), y: cy + r * CGFloat(sin(a))) }
+                // the true path, faint
+                ctx.setStrokeColor(CGColor(gray: 1, alpha: 0.12)); ctx.setLineWidth(1)
+                ctx.addEllipse(in: CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r)); ctx.strokePath()
+                // Long exposure: every frame of one turn, as the eye integrates them.
+                for f in 0..<perTurn {
+                    let theta = omega * Double(f) / hz
+                    let window = Double(cs.frames) / hz
+                    let frameSamples = (0...cs.frames).map { pos(theta - omega * Double(cs.frames - $0) / hz) }
+                    let eventSamples = stride(from: window, through: 0.0005, by: -0.001).map { pos(theta - omega * $0) } + [pos(theta)]
+                    let pts: [CGPoint]
+                    switch col {
+                    case 0: Trail.mode = .adaptive; pts = frameSamples
+                    case 1: Trail.mode = .spline; pts = Trail.smooth(frameSamples)
+                    default: Trail.mode = .spline; pts = Trail.smooth(eventSamples)
+                    }
+                    ctx.saveGState()
+                    ctx.setAlpha(0.55)
+                    ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+                    Trail.draw(in: ctx, points: pts, cursor: cursor, samples: s.samples, strength: s.strength,
+                               headBias: s.headBias, includeHead: true, minDistance: s.minDistance, frames: cs.frames)
+                    ctx.endTransparencyLayer()
+                    ctx.restoreGState()
+                }
             }
         }
-        Trail.mode = .adaptive
+        Trail.mode = .spline
         NSGraphicsContext.restoreGraphicsState()
         try? NSBitmapImageRep(cgImage: ctx.makeImage()!).representation(using: .png, properties: [:])?
             .write(to: URL(fileURLWithPath: path))
