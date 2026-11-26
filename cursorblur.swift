@@ -264,6 +264,51 @@ enum Trail {
     }
 }
 
+/// Builds the shutter path from the per-frame pointer samples (`NSEvent.mouseLocation`
+/// read every display tick), which are always where the pointer really was.
+///
+/// v0.1.2 also merged mouse/trackpad events between frames. That was dropped: macOS can
+/// hold events back and deliver them in a burst with stale positions (e.g. during the
+/// minimize animation, which stretched the trail back to the window button), their
+/// timestamps don't line up exactly with frame samples, and on most hardware they
+/// arrive less often than display frames anyway. The spline does the smoothing.
+enum PathSampler {
+    struct Sample { var p: CGPoint; var t: TimeInterval }
+
+    /// Samples inside [start, now], preceded by the position exactly at `start`.
+    /// Bounded by time, not by count: if ticks stall, the trail cannot reach back
+    /// to where the pointer was before the stall.
+    static func path(_ all: [Sample], start: TimeInterval, now: TimeInterval) -> [CGPoint] {
+        guard let last = all.last else { return [] }
+        var out: [CGPoint] = []
+        if let i = all.lastIndex(where: { $0.t < start }), i + 1 < all.count {
+            let a = all[i], b = all[i + 1]
+            let k = CGFloat((start - a.t) / max(1e-6, b.t - a.t))
+            out.append(CGPoint(x: a.p.x + (b.p.x - a.p.x) * k, y: a.p.y + (b.p.y - a.p.y) * k))
+        }
+        out += all.filter { $0.t >= start && $0.t <= now }.map(\.p)
+        if out.last != last.p { out.append(last.p) }
+        return out
+    }
+
+    /// Checks used by `CURSORBLUR_SELFTEST`.
+    static func selfTest() -> Bool {
+        var ok = true
+        func check(_ name: String, _ cond: Bool) { print(cond ? "PASS" : "FAIL", name); ok = ok && cond }
+        func length(_ p: [CGPoint]) -> CGFloat { zip(p, p.dropFirst()).reduce(0) { $0 + hypot($1.1.x - $1.0.x, $1.1.y - $1.0.y) } }
+        let dt = 1.0 / 120
+        // Cursor moving right 10 pt per frame; trail of 2 frames.
+        let samples = (0...4).map { Sample(p: CGPoint(x: 500 + 10 * CGFloat($0), y: 300), t: Double($0) * dt) }
+        let now = 4 * dt
+        check("trail spans exactly 2 frames (20 pt)", abs(length(path(samples, start: now - 2 * dt, now: now)) - 20) < 0.5)
+        // Ticks stalled for 0.4 s (e.g. during a system animation) while the pointer moved far.
+        let stalled = [Sample(p: CGPoint(x: 20, y: 900), t: 0), Sample(p: CGPoint(x: 800, y: 300), t: 0.4)]
+        check("after a stall the trail does not reach back to the old position",
+              length(path(stalled, start: 0.4 - 2 * dt, now: 0.4)) < 70)
+        return ok
+    }
+}
+
 /// Display timing used for the latency figures shown in the menu.
 enum Timing {
     static var hz: Double { Double(NSScreen.main?.maximumFramesPerSecond ?? 60) }
@@ -712,13 +757,8 @@ final class Controller: NSObject, NSMenuDelegate {
     private var views: [BlurView] = []
     private var windows: [NSWindow] = []
     private var link: CADisplayLink?
-    /// Timestamped pointer positions (system uptime), oldest first: one per display
-    /// frame plus every mouse/trackpad event in between, which records the real path
-    /// between frames when the hardware reports faster than the display refreshes.
-    private var events: [(p: CGPoint, t: TimeInterval)] = []
-    private var eventMonitors: [Any] = []
-    private var debugEvents = 0
-    private var debugMaxOffset: CGFloat = 0
+    /// Timestamped pointer positions (system uptime), one per display frame, oldest first.
+    private var samples: [PathSampler.Sample] = []
     private var statusItem: NSStatusItem?
     private var loginItem: NSMenuItem?
     private var sliders: [SliderRow] = []
@@ -745,11 +785,13 @@ final class Controller: NSObject, NSMenuDelegate {
         if let path = ProcessInfo.processInfo.environment["CURSORBLUR_RENDER_MENU"] {
             renderMenu(to: path); exit(0)
         }
+        if ProcessInfo.processInfo.environment["CURSORBLUR_SELFTEST"] != nil {
+            exit(PathSampler.selfTest() ? 0 : 1)
+        }
         if let path = ProcessInfo.processInfo.environment["CURSORBLUR_RENDER_TRAILS"] {
             renderTrailComparison(to: path); exit(0)
         }
         buildWindows()
-        startEventSampling()
         setupSignals()
         applyCursorVisibility()
 
@@ -794,54 +836,14 @@ final class Controller: NSObject, NSMenuDelegate {
         }
     }
 
-    /// Mouse-moved events need no permission (only key events do). Global events
-    /// cover other apps; the local monitor covers our own menu.
-    private func startEventSampling() {
-        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
-        if let g = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] e in self?.record(e) }) {
-            eventMonitors.append(g)
-        }
-        if let l = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] e in self?.record(e); return e }) {
-            eventMonitors.append(l)
-        }
-    }
-
-    private func record(_ e: NSEvent) {
-        // Global events have no window: locationInWindow is already in screen coordinates.
-        let p = e.window.map { $0.convertPoint(toScreen: e.locationInWindow) } ?? e.locationInWindow
-        insert(p, at: e.timestamp)
-        debugEvents += 1
-        if debug { debugMaxOffset = max(debugMaxOffset, hypot(p.x - NSEvent.mouseLocation.x, p.y - NSEvent.mouseLocation.y)) }
-        if events.count > 2048 { events.removeFirst(events.count - 1024) }
-    }
-
-    /// Events are delivered a little after they happen, so they may land before the
-    /// latest frame sample: keep the buffer sorted by time.
-    private func insert(_ p: CGPoint, at t: TimeInterval) {
-        var i = events.count
-        while i > 0 && events[i - 1].t > t { i -= 1 }
-        if i > 0 && events[i - 1].t == t { return }
-        events.insert((p, t), at: i)
-        if events.count > 4096 { events.removeFirst(events.count - 2048) }
-    }
-
     /// The path covered during the "shutter" (the last `frames` display frames), oldest
     /// first, ending exactly at the current pointer position.
     private func shutterPath(frames: Int, head: CGPoint) -> [CGPoint] {
         let now = ProcessInfo.processInfo.systemUptime
-        let start = now - Double(frames) / Timing.hz
-        insert(head, at: now)
-        if let cut = events.firstIndex(where: { $0.t >= now - 0.25 }), cut > 0 { events.removeFirst(cut) }
-        guard let firstIn = events.firstIndex(where: { $0.t >= start }) else { return [head] }
-        var path: [CGPoint] = []
-        if firstIn > 0 {                                     // position exactly at shutter open
-            let a = events[firstIn - 1], b = events[firstIn]
-            let k = CGFloat((start - a.t) / max(1e-6, b.t - a.t))
-            path.append(CGPoint(x: a.p.x + (b.p.x - a.p.x) * k, y: a.p.y + (b.p.y - a.p.y) * k))
-        }
-        path += events[firstIn...].filter { $0.t <= now }.map(\.p)
-        if path.last != head { path.append(head) }
-        return path
+        samples.append(.init(p: head, t: now))
+        if let cut = samples.firstIndex(where: { $0.t >= now - 0.25 }), cut > 0 { samples.removeFirst(cut) }
+        let path = PathSampler.path(samples, start: now - Double(frames) / Timing.hz, now: now)
+        return path.isEmpty ? [head] : path
     }
 
     @objc private func tick(_ link: CADisplayLink) {
@@ -858,9 +860,8 @@ final class Controller: NSObject, NSMenuDelegate {
             debugFrames += 1
             let now = CACurrentMediaTime()
             if now - debugStart >= 1 {
-                NSLog("cursorblur: %d fps, %d pointer events/s, max event-vs-pointer offset %.1f pt",
-                      debugFrames, debugEvents, debugMaxOffset)
-                debugFrames = 0; debugEvents = 0; debugMaxOffset = 0; debugStart = now
+                NSLog("cursorblur: %d fps", debugFrames)
+                debugFrames = 0; debugStart = now
             }
         }
         // The drawn cursor *is* the cursor in hide mode: refresh its shape every frame.
@@ -1068,15 +1069,14 @@ final class Controller: NSObject, NSMenuDelegate {
         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
     }
 
-    /// Debug aid: fast circles rendered three ways. v0.1.1 joins one sample per frame
-    /// with straight lines; v0.1.2 draws a spline through them, and through the extra
-    /// pointer events when the hardware delivers them (simulated here at 1 kHz).
+    /// Debug aid: fast circles as a one-turn long exposure. v0.1.1 joins one sample per
+    /// frame with straight lines; the current renderer draws a spline through them.
     private func renderTrailComparison(to path: String) {
         let s = Settings.shared
         let cases: [(turns: Double, frames: Int)] = [(3, s.frames), (6, s.frames), (6, 4)]
-        let cols = ["v0.1.1: straight segments", "v0.1.2: spline, frame samples", "v0.1.2: spline + 1 kHz events"]
+        let cols = ["v0.1.1: straight segments", "v0.1.3: spline, same samples"]
         let scale: CGFloat = 2, cell: CGFloat = 230, labelW: CGFloat = 100, header: CGFloat = 34
-        let W = Int((labelW + cell * 3) * scale), H = Int((cell * CGFloat(cases.count) + header) * scale)
+        let W = Int((labelW + cell * 2) * scale), H = Int((cell * CGFloat(cases.count) + header) * scale)
         let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
                             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
         ctx.scaleBy(x: scale, y: scale)
@@ -1099,7 +1099,7 @@ final class Controller: NSObject, NSMenuDelegate {
                 .draw(at: NSPoint(x: 10, y: cy - 22))
             let omega = 2 * .pi * cs.turns
             let perTurn = Int((hz / cs.turns).rounded())         // frames in one turn
-            for col in 0..<3 {
+            for col in 0..<2 {
                 let cx = labelW + cell * CGFloat(col) + cell / 2
                 func pos(_ a: Double) -> CGPoint { CGPoint(x: cx + r * CGFloat(cos(a)), y: cy + r * CGFloat(sin(a))) }
                 // the true path, faint
@@ -1108,14 +1108,11 @@ final class Controller: NSObject, NSMenuDelegate {
                 // Long exposure: every frame of one turn, as the eye integrates them.
                 for f in 0..<perTurn {
                     let theta = omega * Double(f) / hz
-                    let window = Double(cs.frames) / hz
                     let frameSamples = (0...cs.frames).map { pos(theta - omega * Double(cs.frames - $0) / hz) }
-                    let eventSamples = stride(from: window, through: 0.0005, by: -0.001).map { pos(theta - omega * $0) } + [pos(theta)]
                     let pts: [CGPoint]
                     switch col {
                     case 0: Trail.mode = .adaptive; pts = frameSamples
-                    case 1: Trail.mode = .spline; pts = Trail.smooth(frameSamples)
-                    default: Trail.mode = .spline; pts = Trail.smooth(eventSamples)
+                    default: Trail.mode = .spline; pts = Trail.smooth(frameSamples)
                     }
                     ctx.saveGState()
                     ctx.setAlpha(0.55)

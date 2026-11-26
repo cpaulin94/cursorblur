@@ -1,6 +1,6 @@
 # Engineering notes
 
-How cursorblur got from a working prototype to v0.1.2: the issues found while using it
+How cursorblur got from a working prototype to v0.1.3: the issues found while using it
 every day, what caused them, and how each fix was verified.
 
 Most of these never showed up in a quick test. They appeared only in a packaged app,
@@ -10,7 +10,7 @@ at the edge of a control, or at one specific mouse speed.
 
 ## Rendering
 
-### Fast circles drawn as polygons · v0.1.2
+### Fast circles drawn as polygons · v0.1.2, refined in v0.1.3
 
 **Symptom.** Drawing very fast circles, the trail traced a polygon instead of a round
 curve.
@@ -20,26 +20,38 @@ with straight lines. At 6 turns/s and 120 Hz the cursor covers 18° between two 
 Each frame's trail was a straight chord, and the eye adds the frames together into a
 polygon.
 
-**Fix.**
-- **More real samples.** Mouse and trackpad events between frames are recorded with
-  their timestamps and merged with the per-frame samples into one time-ordered buffer.
-  Mouse-moved events need no permission, unlike key events.
-- **A curve through them.** A centripetal Catmull-Rom spline passes through every sample
-  without loops or overshoot. At the newest end, the tangent comes from quadratic
-  extrapolation of the previous samples, so the curve bends toward the head without
-  waiting for a future sample.
-- **Even copies along the curve.** Copies are placed by arc length along the curve,
-  with the same density and opacity rules as before.
+**Fix.** A centripetal Catmull-Rom spline through the samples, which passes through
+every sample without loops or overshoot. At the newest end, the tangent comes from
+quadratic extrapolation of the previous samples, so the curve bends toward the head
+without waiting for a future sample. Copies are placed by arc length along the curve.
+No latency is added.
 
-No latency is added: only past samples are used, and the head is still the latest
-pointer position.
+**Verified.** A one-turn long exposure: every frame of one turn, overlaid as the eye
+integrates them.
 
-**Verified.** A one-turn long exposure (every frame of one turn, overlaid as the eye
-integrates them) at 3 and 6 turns/s. Left to right: straight segments, spline through
-the per-frame samples, spline through 1 kHz events. On the installed app: 120 fps, with
-pointer events arriving without any permission and matching the pointer position.
+![One-turn long exposure of fast circles: straight segments (left) and spline (right)](fast-circles.png)
 
-![One-turn long exposure of fast circles: straight segments (left), spline (centre), spline with 1 kHz events (right)](fast-circles.png)
+### Long trail from the window button while minimizing · v0.1.3
+
+**Symptom.** In v0.1.2, minimizing a window and moving the mouse during the animation
+left a long trail from the yellow button to the pointer.
+
+**Cause.** v0.1.2 also fed the spline mouse and trackpad events recorded between
+frames. macOS can hold those events back during system animations and deliver them
+later in a burst, with stale positions. Those stale points landed inside the trail's
+time window and dragged it back to the button. The diagnostic log also showed that event
+timestamps don't line up exactly with frame samples, so even accepted events could
+bend the curve slightly off course.
+
+**Fix.** Events were dropped. On this hardware they arrived less often than display
+frames anyway (30–60/s against 120), and the spline alone already rounds the circles.
+The trail is now built only from the per-frame pointer position. Its samples are also
+bounded by time, not count, so after any stall it cannot reach back to where the pointer
+used to be.
+
+**Verified.** Self-tests (`CURSORBLUR_SELFTEST=1`): a 2-frame trail spans exactly 2
+frames, and after a 0.4 s stall the trail doesn't reach back to the old position.
+Steady 120 fps on the installed app.
 
 ### Muddy trail at slow speeds, broken trail on fast flicks · v0.1.1
 
@@ -161,7 +173,8 @@ why hiding the real cursor is the default.
 
 ## Tooling
 
-- `CURSORBLUR_DEBUG=1`: logs the render rate and pointer event rate once a second.
+- `CURSORBLUR_DEBUG=1`: logs the render rate once a second.
+- `CURSORBLUR_SELFTEST=1`: runs the trail-path self-tests and exits.
 - `CURSORBLUR_RENDER_MENU=out.png`: renders the menu rows offscreen.
 - `CURSORBLUR_RENDER_TRAILS=out.png`: renders the fast-circle long-exposure comparison.
 - `./build.sh release`: universal binary, Info.plist, signing (ad-hoc or Developer ID),
